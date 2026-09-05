@@ -1,20 +1,21 @@
 import os
 import json
 import time
-
-from typing import TypedDict, List, Dict, Any
-
-from dotenv import load_dotenv
-
 import psycopg
+from typing import TypedDict, List, Dict, Any, Annotated
+from dotenv import load_dotenv
 from pgvector.psycopg import register_vector
-
+from langgraph.graph.message import add_messages
+from langchain_core.messages import AnyMessage
 from openai import OpenAI
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-
+from langchain.chat_models import init_chat_model
 from langgraph.graph import StateGraph, START, END
+from langchain_openrouter import ChatOpenRouter
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.messages import SystemMessage, HumanMessage
+
 
 
 # ============================================================
@@ -33,14 +34,10 @@ load_dotenv()
 openai_key = os.getenv("OPENAI_API_KEY")
 
 if not openai_key:
-    raise ValueError(
-        "OPENAI_API_KEY não foi encontrada no arquivo .env"
-    )
+    raise ValueError("OPENAI_API_KEY não foi encontrada no arquivo .env")
 
 
-openai_client = OpenAI(
-    api_key=openai_key
-)
+openai_client = OpenAI(api_key=openai_key)
 
 
 # ============================================================
@@ -52,15 +49,10 @@ openai_client = OpenAI(
 openrouter_key = os.getenv("OPENROUTER_API_KEY")
 
 if not openrouter_key:
-    raise ValueError(
-        "OPENROUTER_API_KEY não foi encontrada no arquivo .env"
-    )
+    raise ValueError("OPENROUTER_API_KEY não foi encontrada no arquivo .env")
 
 
-llm_client = OpenAI(
-    api_key=openrouter_key,
-    base_url="https://openrouter.ai/api/v1"
-)
+llm_client = ChatOpenRouter(model="google/gemini-3.7-flash",api_key=openrouter_key)
 
 
 # ============================================================
@@ -86,9 +78,7 @@ EMBEDDING_DIMENSIONS = 1536
 DB_URI = os.getenv("DB_URI")
 
 if not DB_URI:
-    raise ValueError(
-        "DB_URI não foi encontrada no arquivo .env"
-    )
+    raise ValueError("DB_URI não foi encontrada no arquivo .env")
 
 
 print()
@@ -97,35 +87,25 @@ print("CONECTANDO AO POSTGRESQL")
 print("========================================")
 
 
-conn = psycopg.connect(
-    DB_URI,
-    autocommit=True
-)
+conn = psycopg.connect(DB_URI,autocommit=True)
 
 
-print(
-    "PostgreSQL conectado com sucesso!"
-)
+print("PostgreSQL conectado com sucesso!")
 
 
 # ============================================================
 # CONFIGURAR PGVECTOR
 # ============================================================
 
-conn.execute(
-    "CREATE EXTENSION IF NOT EXISTS vector;"
-)
+conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
 register_vector(conn)
 
-
-print(
-    "pgvector configurado com sucesso!"
-)
+print("pgvector configurado com sucesso!")
 
 
 # ============================================================
-# CRIAR / CORRIGIR TABELA ARTICLES
+# CRIAR TABELA ARTICLES SE NECESSÁRIO
 # ============================================================
 
 print()
@@ -146,56 +126,11 @@ conn.execute(
     """
 )
 
-
-# ============================================================
-# GARANTIR QUE AS COLUNAS EXISTAM
-#
-# Isso corrige o problema:
-#
-# psycopg.errors.UndefinedColumn:
-# coluna a.titulo não existe
-# ============================================================
-
-conn.execute(
-    """
-    ALTER TABLE articles
-    ADD COLUMN IF NOT EXISTS titulo TEXT;
-    """
-)
-
-
-conn.execute(
-    """
-    ALTER TABLE articles
-    ADD COLUMN IF NOT EXISTS texto TEXT;
-    """
-)
-
-
-conn.execute(
-    """
-    ALTER TABLE articles
-    ADD COLUMN IF NOT EXISTS metadata JSONB;
-    """
-)
-
-
-conn.execute(
-    """
-    ALTER TABLE articles
-    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP
-    DEFAULT CURRENT_TIMESTAMP;
-    """
-)
-
-
-print(
-    "Tabela articles configurada!"
-)
+print("Tabela articles configurada!")
 
 
 # ============================================================
-# CRIAR / CORRIGIR TABELA ARTICLE_CHUNKS
+# CRIAR TABELA ARTICLE_CHUNKS SE NECESSÁRIO
 # ============================================================
 
 print()
@@ -228,47 +163,7 @@ conn.execute(
     """
 )
 
-
-# ============================================================
-# GARANTIR COLUNAS DO ARTICLE_CHUNKS
-# ============================================================
-
-conn.execute(
-    """
-    ALTER TABLE article_chunks
-    ADD COLUMN IF NOT EXISTS article_id VARCHAR(255);
-    """
-)
-
-
-conn.execute(
-    """
-    ALTER TABLE article_chunks
-    ADD COLUMN IF NOT EXISTS chunk_index INTEGER;
-    """
-)
-
-
-conn.execute(
-    """
-    ALTER TABLE article_chunks
-    ADD COLUMN IF NOT EXISTS text TEXT;
-    """
-)
-
-
-conn.execute(
-    """
-    ALTER TABLE article_chunks
-    ADD COLUMN IF NOT EXISTS embedding VECTOR(1536);
-    """
-)
-
-
-print(
-    "Tabela article_chunks configurada!"
-)
-
+print("Tabela article_chunks configurada!")
 
 # ============================================================
 # ÍNDICE DO PGVECTOR
@@ -289,10 +184,7 @@ conn.execute(
     """
 )
 
-
-print(
-    "Índice HNSW configurado!"
-)
+print("Índice HNSW configurado!")
 
 
 # ============================================================
@@ -303,6 +195,10 @@ class GraphState(TypedDict):
 
     question: str
 
+    retrieval_question: str
+
+    messages: Annotated[list[AnyMessage], add_messages]
+
     relevant_chunks: List[Dict[str, Any]]
 
     answer: str
@@ -312,11 +208,7 @@ class GraphState(TypedDict):
 # FASTAPI
 # ============================================================
 
-app = FastAPI(
-    title="RAG G1 API",
-    description="RAG com LangGraph, PostgreSQL, PGVector e OpenRouter",
-    version="1.0.0"
-)
+app = FastAPI(title="RAG G1 API",description="RAG com LangGraph, PostgreSQL, PGVector e OpenRouter",version="1.0.0")
 
 
 # ============================================================
@@ -332,7 +224,7 @@ class ChatMessage(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
 
-    model: str = "rag-g1"
+    model: str = "rag"
 
     messages: List[ChatMessage]
 
@@ -341,11 +233,7 @@ class ChatCompletionRequest(BaseModel):
 # DIVIDIR TEXTO EM CHUNKS
 # ============================================================
 
-def split_text(
-    text: str,
-    chunk_size: int = 1000,
-    chunk_overlap: int = 200
-):
+def split_text(text: str,chunk_size: int = 1000,chunk_overlap: int = 200):
 
     chunks = []
 
@@ -372,10 +260,7 @@ def split_text(
 
 def get_openai_embedding(text: str):
 
-    response = openai_client.embeddings.create(
-        input=text,
-        model=EMBEDDING_MODEL
-    )
+    response = openai_client.embeddings.create(input=text,model=EMBEDDING_MODEL)
 
     return response.data[0].embedding
 
@@ -409,57 +294,39 @@ def index_article(article):
 
     article_id = article["id"]
 
-    metadata = article.get(
-        "metadata",
-        {}
-    )
+    metadata = article.get("metadata",{}) or {}
 
-    titulo = metadata.get(
-        "titulo",
-        ""
-    )
+    # Aceita o título tanto no nível principal quanto em metadata.
+    # No G1, o título está dentro de metadata.
+    titulo = (article.get("titulo") or metadata.get("titulo")or "")
 
-    texto = article.get(
-        "texto",
-        ""
-    )
+    texto = article.get("texto","") or ""
 
+    # ========================================================
+    # IGNORAR NOTÍCIAS JÁ INDEXADAS
+    # ========================================================
 
-    if not texto or not texto.strip():
+    if article_exists(article_id):
 
-        print(
-            f"Notícia {article_id} não possui texto."
-        )
+        print(f"Notícia já existe: {article_id}")
 
         return
 
 
     # ========================================================
-    # VERIFICAR SE A NOTÍCIA JÁ EXISTE
+    # PARA NOTÍCIA NOVA, O TEXTO É OBRIGATÓRIO
     # ========================================================
 
-    if article_exists(article_id):
+    if not texto.strip():
 
-        print(
-            f"Notícia já existe: {article_id}"
-        )
+        print(f"Notícia {article_id} não possui texto.")
 
         return
 
 
     print()
-    print(
-        f"Nova notícia: {article_id}"
-    )
-
-    print(
-        f"Título: {titulo}"
-    )
-
-
-    # ========================================================
-    # SALVAR NOTÍCIA ORIGINAL
-    # ========================================================
+    print(f"Nova notícia: {article_id}")
+    print(f"Título: {titulo}")
 
     conn.execute(
         """
@@ -478,49 +345,19 @@ def index_article(article):
         ON CONFLICT (id)
         DO NOTHING;
         """,
-        (
-            article_id,
-            titulo,
-            texto,
-            json.dumps(metadata)
-        )
+        (article_id,titulo,texto,json.dumps(metadata))
     )
 
+    chunks = split_text(texto)
 
-    # ========================================================
-    # DIVIDIR NOTÍCIA EM CHUNKS
-    # ========================================================
+    print(f"Total de chunks: {len(chunks)}")
 
-    chunks = split_text(
-        texto
-    )
-
-
-    print(
-        f"Total de chunks: {len(chunks)}"
-    )
-
-
-    # ========================================================
-    # GERAR EMBEDDINGS
-    # ========================================================
 
     for chunk_index, chunk in enumerate(chunks):
 
-        print(
-            f"Gerando embedding "
-            f"{chunk_index + 1}/{len(chunks)}..."
-        )
+        print(f"Gerando embedding "f"{chunk_index + 1}/{len(chunks)}...")
 
-
-        embedding = get_openai_embedding(
-            chunk
-        )
-
-
-        # ====================================================
-        # SALVAR CHUNK
-        # ====================================================
+        embedding = get_openai_embedding(chunk)
 
         conn.execute(
             """
@@ -542,18 +379,10 @@ def index_article(article):
             )
             DO NOTHING;
             """,
-            (
-                article_id,
-                chunk_index,
-                chunk,
-                embedding
-            )
+            (article_id,chunk_index,chunk,embedding)
         )
 
-
-    print(
-        f"Notícia {article_id} indexada com sucesso!"
-    )
+    print(f"Notícia {article_id} indexada com sucesso!")
 
 
 # ============================================================
@@ -563,32 +392,17 @@ def index_article(article):
 def load_documents_from_json(json_path):
 
     print()
-    print(
-        "========================================"
-    )
-
-    print(
-        "CARREGANDO NOTÍCIAS DO JSON"
-    )
-
-    print(
-        "========================================"
-    )
+    print("========================================")
+    print("CARREGANDO NOTÍCIAS DO JSON")
+    print("========================================")
 
 
-    with open(
-        json_path,
-        "r",
-        encoding="utf-8"
-    ) as file:
+    with open(json_path,"r",encoding="utf-8") as file:
 
         data = json.load(file)
 
 
-    print(
-        f"{len(data)} notícias encontradas."
-    )
-
+    print(f"{len(data)} notícias encontradas.")
 
     return data
 
@@ -600,506 +414,373 @@ def load_documents_from_json(json_path):
 def index_documents(documents):
 
     print()
-    print(
-        "========================================"
-    )
-
-    print(
-        "INICIANDO INDEXAÇÃO"
-    )
-
-    print(
-        "========================================"
-    )
+    print("========================================")
+    print("INICIANDO INDEXAÇÃO")
+    print("========================================")
 
 
     for article in documents:
 
         try:
 
-            index_article(
-                article
-            )
+            index_article(article)
 
         except Exception as e:
 
             print()
-            print(
-                "ERRO AO INDEXAR NOTÍCIA:"
-            )
-
-            print(
-                e
-            )
-
-            print(
-                f"ID da notícia: "
-                f"{article.get('id', 'desconhecido')}"
-            )
-
+            print("ERRO AO INDEXAR NOTÍCIA:")
+            print(e)
+            print(f"ID da notícia: "f"{article.get('id', 'desconhecido')}")
 
     print()
-    print(
-        "========================================"
-    )
+    print("========================================")
+    print("INDEXAÇÃO FINALIZADA")
+    print("========================================")
 
-    print(
-        "INDEXAÇÃO FINALIZADA"
-    )
 
-    print(
-        "========================================"
-    )
+# ============================================================
+# CONTEXTUALIZAR PERGUNTA PARA O RETRIEVAL
+# ============================================================
+
+def contextualize_question(state: GraphState):
+
+    question = state["question"]
+
+    history = state.get("messages", [])
+
+    print()
+    print("[LANGGRAPH] contextualize_question")
+
+    # Se não existe histórico, não há nada para resolver.
+    if not history:
+
+        print(f"Pergunta de retrieval: {question}")
+
+        return {
+            "retrieval_question": question
+        }
+
+    prompt = """
+    Sua tarefa é reescrever a pergunta atual do usuário
+    como uma pergunta independente e completa para ser
+    utilizada em uma busca semântica.
+
+    Utilize o histórico da conversa apenas para resolver
+    referências como:
+
+    - ele;
+    - ela;
+    - isso;
+    - aquilo;
+    - esse caso;
+    - essa pessoa;
+    - esse acontecimento;
+    - o político;
+    - o presidente;
+    - o candidato.
+
+    Exemplo:
+
+    Histórico:
+    Usuário: O que aconteceu com Flávio Bolsonaro?
+
+    Pergunta atual:
+    Ele comentou sobre isso?
+
+    Saída:
+    Flávio Bolsonaro comentou sobre o acontecimento mencionado?
+
+    NÃO responda à pergunta.
+
+    NÃO acrescente fatos.
+
+    NÃO faça explicações.
+
+    Retorne SOMENTE a pergunta reescrita.
+
+    Se a pergunta atual já for completamente independente,
+    apenas repita a pergunta.
+    """
+
+    # Evita mandar uma conversa gigantesca.
+    recent_history = history[-6:]
+
+    messages = [SystemMessage(content=prompt),*recent_history,HumanMessage(content=question)]
+
+    response = llm_client.invoke(messages)
+
+    retrieval_question = response.content.strip()
+
+    print(f"Pergunta original: {question}")
+    print(f"Pergunta de retrieval: {retrieval_question}")
+
+    return {
+        "retrieval_question": retrieval_question
+    }
 
 
 # ============================================================
 # RETRIEVAL
 # ============================================================
 
-def retrieve_documents(
-    state: GraphState
-):
+def retrieve_documents(state: GraphState):
 
     question = state["question"]
 
+    retrieval_question = state["retrieval_question"]
 
     print()
-    print(
-        "[LANGGRAPH] retrieve_documents"
-    )
+    print("[LANGGRAPH] retrieve_documents")
 
+    print(f"Buscando documentos para: "f"{retrieval_question}")
 
-    # ========================================================
-    # EMBEDDING DA PERGUNTA
-    # ========================================================
-
-    query_embedding = get_openai_embedding(
-        question
-    )
-
-
-    # ========================================================
-    # BUSCAR CHUNKS
-    # ========================================================
+    query_embedding = get_openai_embedding(retrieval_question)
 
     with conn.cursor() as cur:
-
         cur.execute(
             """
-            SELECT
+            WITH resultados AS (
 
-                ac.id,
+                SELECT
+                    ac.id,
+                    ac.article_id,
+                    ac.chunk_index,
+                    ac.text,
 
-                ac.article_id,
+                    ac.embedding <=> %s::vector AS distance,
 
-                ac.chunk_index,
+                    1 - (
+                        ac.embedding <=> %s::vector
+                    ) AS similarity,
 
-                ac.text,
+                    a.titulo,
+                    a.metadata,
+                    a.texto
 
-                ac.embedding <=> %s::vector
-                    AS distance,
+                FROM article_chunks ac
 
-                1 - (
+                INNER JOIN articles a
+                    ON a.id = ac.article_id
+
+                ORDER BY
                     ac.embedding <=> %s::vector
-                )
-                    AS similarity,
 
-                a.titulo,
+                LIMIT 20
+            )
 
-                a.metadata,
-
-                a.texto
-
-            FROM article_chunks ac
-
-            INNER JOIN articles a
-                ON a.id = ac.article_id
+            SELECT *
+            FROM resultados
 
             ORDER BY
-                ac.embedding <=> %s::vector
+                (metadata->>'data')::timestamptz DESC
 
             LIMIT 5;
             """,
-            (
-                query_embedding,
-                query_embedding,
-                query_embedding
-            )
+            (query_embedding,query_embedding,query_embedding)
         )
-
 
         rows = cur.fetchall()
 
-
     relevant_chunks = []
-
-
-    # ========================================================
-    # ORGANIZAR RESULTADOS
-    # ========================================================
 
     for row in rows:
 
-        relevant_chunks.append({
+        relevant_chunks.append({"chunk_id": row[0],"article_id": row[1],"chunk_index": row[2],"text": row[3],"distance": row[4],"similarity": row[5],"titulo": row[6],"metadata": row[7] or {},"article_text": row[8]})
 
-            "chunk_id": row[0],
+    print(f"Chunks recuperados: "f"{len(relevant_chunks)}")
 
-            "article_id": row[1],
-
-            "chunk_index": row[2],
-
-            "text": row[3],
-
-            "distance": row[4],
-
-            "similarity": row[5],
-
-            "titulo": row[6],
-
-            "metadata": row[7] or {},
-
-            "article_text": row[8]
-
-        })
-
-
-    print(
-        f"Chunks recuperados: "
-        f"{len(relevant_chunks)}"
-    )
-
-
-    # ========================================================
-    # MOSTRAR RESULTADOS DO RETRIEVAL
-    # ========================================================
-
-    for i, chunk in enumerate(
-        relevant_chunks,
-        start=1
-    ):
+    for i, chunk in enumerate(relevant_chunks,start=1):
 
         print()
-        print(
-            f"Documento {i}"
-        )
-
-        print(
-            f"Título: {chunk['titulo']}"
-        )
-
-        print(
-            f"Similaridade: "
-            f"{chunk['similarity']:.4f}"
-        )
+        print(f"Documento {i}")
+        print(f"Similaridade: "f"{chunk['similarity']:.4f}")
 
 
-    return {
-
-        "relevant_chunks":
-            relevant_chunks
-
-    }
+    return {"relevant_chunks":relevant_chunks,"messages":[question]}
 
 
 # ============================================================
 # GERAR RESPOSTA
 # ============================================================
 
-def generate_response(
-    state: GraphState
-):
+def generate_response(state: GraphState):
 
     question = state["question"]
 
-    relevant_chunks = state[
-        "relevant_chunks"
-    ]
-
+    relevant_chunks = state["relevant_chunks"]
 
     print()
-    print(
-        "[LANGGRAPH] generate_response"
-    )
-
-
-    # ========================================================
-    # CASO NÃO ENCONTRE DOCUMENTOS
-    # ========================================================
+    print("[LANGGRAPH] generate_response")
 
     if not relevant_chunks:
 
-        return {
-
-            "answer":
+        return {"answer":
                 "Não encontrei informações suficientes "
                 "nas notícias disponíveis para responder "
-                "à pergunta."
-
-        }
-
-
-    # ========================================================
-    # CONSTRUIR CONTEXTO
-    # ========================================================
+                "à pergunta."}
 
     context_parts = []
 
+    for i, chunk in enumerate(relevant_chunks, start=1):
+        
+        metadata = chunk.get("metadata",{})
 
-    for i, chunk in enumerate(
-        relevant_chunks,
-        start=1
-    ):
+        titulo = chunk.get("titulo","")
 
-        metadata = chunk.get(
-            "metadata",
-            {}
-        )
+        data = metadata.get("data","")
 
-
-        titulo = chunk.get(
-            "titulo",
-            ""
-        )
-
-
-        data = metadata.get(
-            "data",
-            ""
-        )
-
-
-        url = metadata.get(
-            "url",
-            ""
-        )
-
+        url = metadata.get("url","")
 
         source_info = ""
 
-
         if titulo:
-
-            source_info += (
-                f"Título: {titulo}\n"
-            )
-
+            source_info += (f"Título: {titulo}\n")
 
         if data:
-
-            source_info += (
-                f"Data: {data}\n"
-            )
-
+            source_info += (f"Data: {data}\n")
 
         if url:
-
-            source_info += (
-                f"URL: {url}\n"
-            )
-
+            source_info += (f"URL: {url}\n")
 
         context_parts.append(
             f"""
---- TRECHO {i} ---
+                    --- TRECHO {i} ---
 
-{source_info}
+                    {source_info}
 
-Conteúdo do trecho:
+                    Conteúdo do trecho:
 
-{chunk["text"]}
+                    {chunk["text"]}
 
-Similaridade:
+                    Similaridade:
 
-{chunk["similarity"]:.4f}
-"""
-        )
+                    {chunk["similarity"]:.4f}
+                    """
+                            )
 
-
-    context = "\n".join(
-        context_parts
-    )
-
-
-    # ========================================================
-    # PROMPT
-    # ========================================================
+    context = "\n".join(context_parts)
 
     prompt = f"""
-Você é um assistente especializado em análise
-e explicação de notícias.
+        Você é um assistente especializado em análise
+        e explicação de notícias.
 
-O modelo utilizado para gerar a resposta é:
+        O modelo utilizado para gerar a resposta é:
 
-{LLM_MODEL}
+        {LLM_MODEL}
 
-Sua função é responder às perguntas do usuário
-como um jornalista experiente.
+        Sua função é responder às perguntas do usuário
+        como um jornalista experiente.
 
-Apresente as informações de maneira:
+        Apresente as informações de maneira:
 
-- clara;
-- detalhada;
-- objetiva;
-- contextualizada;
-- informativa.
+        - clara;
+        - detalhada;
+        - objetiva;
+        - contextualizada;
+        - informativa.
 
-REGRAS FUNDAMENTAIS:
+        REGRAS FUNDAMENTAIS:
 
-1. Utilize SOMENTE as informações presentes
-   nos trechos fornecidos.
+        1. Utilize SOMENTE as informações presentes
+        nos trechos fornecidos.
 
-2. NÃO invente fatos.
+        2. NÃO invente fatos.
 
-3. NÃO invente nomes.
+        3. NÃO invente nomes.
 
-4. NÃO invente datas.
+        4. NÃO invente datas.
 
-5. NÃO invente números.
+        5. NÃO invente números.
 
-6. NÃO invente acontecimentos.
+        6. NÃO invente acontecimentos.
 
-7. Não considere uma afirmação verdadeira
-   simplesmente porque ela aparece na pergunta.
+        7. Não considere uma afirmação verdadeira
+        simplesmente porque ela aparece na pergunta.
 
-8. Se os documentos não tiverem informações
-   suficientes para responder à pergunta,
-   informe claramente essa limitação.
+        8. Se os documentos não tiverem informações
+        suficientes para responder à pergunta,
+        informe claramente essa limitação.
 
-9. Diferencie fatos relatados nos documentos
-   de interpretações.
+        9. Diferencie fatos relatados nos documentos
+        de interpretações.
 
-10. Quando houver informações conflitantes
-    entre os trechos, apresente a divergência.
+        10. Quando houver informações conflitantes
+            entre os trechos, apresente a divergência.
 
-11. Não invente informações para preencher
-    lacunas.
+        11. Não invente informações para preencher
+            lacunas.
 
-12. Não diga que realizou uma busca na internet.
+        12. Não diga que realizou uma busca na internet.
 
-13. Baseie a resposta exclusivamente no contexto
-    fornecido.
+        13. Baseie a resposta exclusivamente no contexto
+            fornecido.
 
-14. Sempre mostre a fonte da notícia quando
-    houver URL disponível.
+        14. Sempre mostre a fonte da notícia quando
+            houver URL disponível.
 
-15. Sempre informe a data da notícia no início
-    da resposta quando a data estiver disponível.
+        15. Sempre informe a data da notícia no início
+            da resposta quando a data estiver disponível.
 
-16. Se houver várias notícias sobre o mesmo
-    acontecimento, utilize as informações
-    complementares entre elas.
+        16. Se houver várias notícias sobre o mesmo
+            acontecimento, utilize as informações
+            complementares entre elas.
 
-17. Não confunda uma notícia que desmente
-    determinado fato com uma notícia que afirma
-    que o fato aconteceu.
+        17. Não confunda uma notícia que desmente
+            determinado fato com uma notícia que afirma
+            que o fato aconteceu.
 
-18. Se a pergunta pressupuser que determinado
-    acontecimento ocorreu, verifique essa
-    afirmação somente com base nos documentos.
+        18. Se a pergunta pressupuser que determinado
+            acontecimento ocorreu, verifique essa
+            afirmação somente com base nos documentos.
 
-CONTEXTO DOS DOCUMENTOS:
+        19. ---------
 
-{context}
+        CONTEXTO DOS DOCUMENTOS:
 
-PERGUNTA DO USUÁRIO:
+        {context}
 
-{question}
+        PERGUNTA DO USUÁRIO:
 
-Responda como um jornalista apresentando
-uma informação ao público.
-"""
+        {question}
 
 
-    # ========================================================
-    # OPENROUTER
-    # ========================================================
+        Responda como um jornalista apresentando
+        uma informação ao público.
+        """
+
 
     print()
-    print(
-        f"[OPENROUTER] Modelo: {LLM_MODEL}"
-    )
+    print(f"[OPENROUTER] Modelo: {LLM_MODEL}")
 
+    messages = [SystemMessage(content=prompt),*state["messages"]]
 
-    response = llm_client.chat.completions.create(
+    response = llm_client.invoke(messages)
 
-        model=LLM_MODEL,
-
-        messages=[
-
-            {
-                "role": "system",
-                "content": prompt
-            },
-
-            {
-                "role": "user",
-                "content": question
-            }
-
-        ]
-
-    )
-
-
-    answer = (
-        response
-        .choices[0]
-        .message
-        .content
-    )
-
-
-    return {
-
-        "answer": answer
-
-    }
+    return {"answer": response.content,"messages":[response]}
 
 
 # ============================================================
 # CONSTRUIR LANGGRAPH
 # ============================================================
 
-workflow = StateGraph(
-    GraphState
-)
 
+config = {"configurable": {"thread_id": "1"}}
+checkpointer = InMemorySaver()
 
-workflow.add_node(
-    "retrieve_documents",
-    retrieve_documents
-)
+workflow = StateGraph(GraphState)
+workflow.add_node("contextualize_question",contextualize_question)
+workflow.add_node("retrieve_documents",retrieve_documents)
+workflow.add_node("generate_response",generate_response)
+workflow.add_edge(START,"contextualize_question")
+workflow.add_edge("contextualize_question","retrieve_documents")
+workflow.add_edge("retrieve_documents","generate_response")
+workflow.add_edge("generate_response",END)
 
-
-workflow.add_node(
-    "generate_response",
-    generate_response
-)
-
-
-workflow.add_edge(
-    START,
-    "retrieve_documents"
-)
-
-
-workflow.add_edge(
-    "retrieve_documents",
-    "generate_response"
-)
-
-
-workflow.add_edge(
-    "generate_response",
-    END
-)
-
-
-graph = workflow.compile()
+graph = workflow.compile(checkpointer=checkpointer)
 
 
 # ============================================================
-# ENDPOINT DE TEST
+# ENDPOINT RAIZ
 # ============================================================
 
 @app.get("/")
@@ -1113,17 +794,13 @@ def root():
 
         "model": LLM_MODEL,
 
-        "embedding_model":
-            EMBEDDING_MODEL
+        "embedding_model":EMBEDDING_MODEL
 
     }
 
 
 # ============================================================
 # ENDPOINT /V1/MODELS
-#
-# Necessário para clientes compatíveis com OpenAI,
-# incluindo Open WebUI.
 # ============================================================
 
 @app.get("/v1/models")
@@ -1133,39 +810,57 @@ def list_models():
 
         "object": "list",
 
-        "data": [
-
-            {
+        "data": [{
 
                 "id": "rag-g1",
 
                 "object": "model",
 
-                "created": int(
-                    time.time()
-                ),
+                "created": int(time.time()),
 
-                "owned_by": "rag-g1"
-
-            }
-
-        ]
+                "owned_by": "rag-g1"}]
 
     }
 
 
 # ============================================================
-# ENDPOINT OPENAI COMPATIBLE
-#
-# OPEN WEBUI UTILIZARÁ ESTE ENDPOINT
+# IDENTIFICAR REQUISIÇÕES INTERNAS DO OPEN WEBUI
 # ============================================================
 
-@app.post(
-    "/v1/chat/completions"
-)
-def chat_completions(
-    request: ChatCompletionRequest
-):
+def is_openwebui_internal_request(question: str):
+
+    internal_markers = [
+
+        "### Task:",
+        "Generate a concise title",
+        "Suggest 3-5 relevant follow-up questions",
+        "Generate 1-3 broad tags",
+        "### Chat History:",
+        "<chat_history>",
+        "### Guidelines:",
+        "### Output:",
+        "JSON format:"
+
+    ]
+
+
+    for marker in internal_markers:
+
+        if marker in question:
+
+            return True
+
+
+    return False
+
+
+# ============================================================
+# ENDPOINT OPENAI COMPATIBLE
+# ============================================================
+
+@app.post("/v1/chat/completions")
+
+def chat_completions(request: ChatCompletionRequest):
 
     try:
 
@@ -1175,10 +870,7 @@ def chat_completions(
 
         question = ""
 
-
-        for message in reversed(
-            request.messages
-        ):
+        for message in reversed(request.messages):
 
             if message.role == "user":
 
@@ -1189,101 +881,77 @@ def chat_completions(
 
         if not question:
 
-            raise HTTPException(
-                status_code=400,
-                detail="Nenhuma pergunta do usuário foi encontrada."
-            )
+            raise HTTPException(status_code=400,detail="Nenhuma pergunta do usuário foi encontrada.")
 
+
+        # ====================================================
+        # IGNORAR REQUISIÇÕES INTERNAS DO OPEN WEBUI
+        #
+        # Exemplos:
+        #
+        # - geração de título
+        # - geração de tags
+        # - sugestões de perguntas
+        #
+        # Essas requisições não serão enviadas
+        # para o LangGraph.
+        # =====================================================
+
+        if is_openwebui_internal_request(question):
+
+            return {
+
+                "id":"rag-g1-internal",
+
+                "object":"chat.completion",
+
+                "created":int(time.time()),
+
+                "model":"rag-g1",
+
+                "choices": [{"index":0,"message": {"role":"assistant","content":" "},"finish_reason":"stop"}]
+
+            }
+
+
+        # ====================================================
+        # A PARTIR DAQUI É PERGUNTA REAL
+        #
+        # SOMENTE AGORA APARECE NO TERMINAL
+        # ====================================================
 
         print()
-        print(
-            "========================================"
-        )
-
-        print(
-            "NOVA PERGUNTA"
-        )
-
-        print(
-            question
-        )
-
-        print(
-            "========================================"
-        )
-
+        print()
+        print("========================================")
+        print("PERGUNTA DO USUÁRIO")
+        print("========================================")
+        print(question)
+        print("========================================")
 
         # ====================================================
         # EXECUTAR LANGGRAPH
         # ====================================================
 
-        result = graph.invoke(
+        result = graph.invoke({"question":question,"relevant_chunks":[],"answer":""},config)
 
-            {
-
-                "question":
-                    question,
-
-                "relevant_chunks":
-                    [],
-
-                "answer":
-                    ""
-
-            }
-
-        )
-
-
-        answer = result[
-            "answer"
-        ]
+        answer = result["answer"]
 
 
         # ====================================================
-        # FORMATO COMPATÍVEL COM OPENAI
+        # RETORNO OPENAI COMPATIBLE
         # ====================================================
 
         return {
 
-            "id":
-                "rag-g1-completion",
+            "id":"rag-g1-completion",
 
-            "object":
-                "chat.completion",
+            "object":"chat.completion",
 
-            "created":
-                int(
-                    time.time()
-                ),
+            "created":int(time.time()),
 
-            "model":
-                "rag-g1",
+            "model":"rag-g1",
 
-            "choices": [
-
-                {
-
-                    "index":
-                        0,
-
-                    "message": {
-
-                        "role":
-                            "assistant",
-
-                        "content":
-                            answer
-
-                    },
-
-                    "finish_reason":
-                        "stop"
-
-                }
-
-            ]
-
+            "choices": [{"index":0,"message": {"role":"assistant","content":answer},"finish_reason":"stop"}]
         }
 
 
@@ -1295,34 +963,13 @@ def chat_completions(
     except Exception as e:
 
         print()
-        print(
-            "========================================"
-        )
+        print("========================================")
+        print("ERRO NO RAG")
+        print("========================================")
+        print(repr(e))
+        print("========================================")
 
-        print(
-            "ERRO NO RAG"
-        )
-
-        print(
-            "========================================"
-        )
-
-        print(
-            repr(e)
-        )
-
-        print(
-            "========================================"
-        )
-
-
-        raise HTTPException(
-
-            status_code=500,
-
-            detail=str(e)
-
-        )
+        raise HTTPException(status_code=500,detail=str(e))
 
 
 # ============================================================
@@ -1335,50 +982,20 @@ if __name__ == "__main__":
 
 
     print()
-    print(
-        "========================================"
-    )
+    print("========================================")
+    print("RAG G1 API")
+    print("========================================")
 
-    print(
-        "RAG G1 API"
-    )
-
-    print(
-        "========================================"
-    )
-
-    print(
-        f"LLM: {LLM_MODEL}"
-    )
-
-    print(
-        f"Embedding: {EMBEDDING_MODEL}"
-    )
-
-    print(
-        "API: http://localhost:8000"
-    )
+    print(f"LLM: {LLM_MODEL}")
+    print(f"Embedding: {EMBEDDING_MODEL}")
+    print("API: http://localhost:8000")
 
     print()
-    print(
-        "Endpoints:"
-    )
-
-    print(
-        "GET  http://localhost:8000/"
-    )
-
-    print(
-        "GET  http://localhost:8000/v1/models"
-    )
-
-    print(
-        "POST http://localhost:8000/v1/chat/completions"
-    )
-
-    print(
-        "========================================"
-    )
+    print("Endpoints:")
+    print("GET  http://localhost:8000/")
+    print("GET  http://localhost:8000/v1/models")
+    print("POST http://localhost:8000/v1/chat/completions")
+    print("========================================")
 
 
     # ========================================================
@@ -1388,38 +1005,19 @@ if __name__ == "__main__":
     json_path = "./news_articles.json"
 
 
-    if os.path.exists(
-        json_path
-    ):
+    if os.path.exists(json_path):
 
-        documents = (
-            load_documents_from_json(
-                json_path
-            )
-        )
+        documents = (load_documents_from_json(json_path))
 
-
-        index_documents(
-            documents
-        )
+        index_documents(documents)
 
     else:
 
-        print(
-            f"Arquivo {json_path} não encontrado."
-        )
+        print(f"Arquivo {json_path} não encontrado.")
 
 
     # ========================================================
     # INICIAR FASTAPI
     # ========================================================
 
-    uvicorn.run(
-
-        app,
-
-        host="0.0.0.0",
-
-        port=8000
-
-    )
+    uvicorn.run(app,host="0.0.0.0",port=8000)
